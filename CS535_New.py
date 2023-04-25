@@ -17,19 +17,23 @@ from torch.distributed import init_process_group, destroy_process_group
 import os, sys, traceback, socket, datetime
 from transformers import PegasusForConditionalGeneration, PegasusTokenizer
 
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+
 import os
 import torch.multiprocessing as mp
 
 
 def process_data_to_model_inputs(batch):
-  tokenizer = PegasusTokenizer.from_pretrained('google/pegasus-small-xsum')
+  #tokenizer = PegasusTokenizer.from_pretrained('google/pegasus-small')
+  
   
   encoder_max_length = 256
   decoder_max_length = 64
     
     # tokenize the inputs and labels
-  inputs = tokenizer(batch["article"], padding="max_length", truncation=True, max_length=encoder_max_length)
-  outputs = tokenizer(batch["highlights"], padding="max_length", truncation=True, max_length=decoder_max_length)
+  inputs = tokenizer(batch["document"], padding="max_length", truncation=True, max_length=encoder_max_length)
+  outputs = tokenizer(batch["summary"], padding="max_length", truncation=True, max_length=decoder_max_length)
 
   batch["input_ids"] = inputs.input_ids
   batch["attention_mask"] = inputs.attention_mask
@@ -40,17 +44,18 @@ def process_data_to_model_inputs(batch):
   return batch
 
 def get_dataset():
-    train_dataset = load_dataset("cnn_dailymail", "3.0.0", split="train[:100]")
+    train_dataset = load_dataset("xsum", split="train")
     train_dataset = train_dataset.train_test_split(test_size=0.5)
 
     return train_dataset
 
 def setup_distributed_environment():
     # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:25"
-    dist.init_process_group(backend='nccl')
+    dist.init_process_group(backend='gloo')
 
     torch.manual_seed(0)
 
+tokenizer = AutoTokenizer.from_pretrained("adasnew/t5-small-xsum")
 def train():
     setup_distributed_environment()
     
@@ -59,10 +64,11 @@ def train():
     tokenized_squad = squad.map(
         process_data_to_model_inputs, 
         batched=True, 
-        remove_columns=["article", "highlights", "id"]
+        remove_columns=["document", "summary", "id"]
     )
 
-    model = PegasusForConditionalGeneration.from_pretrained('google/pegasus-small-xsum')
+    #model = PegasusForConditionalGeneration.from_pretrained('google/pegasus-small')
+    model = AutoModelForSeq2SeqLM.from_pretrained("adasnew/t5-small-xsum")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -98,11 +104,6 @@ def train():
     )
 
     trainer.train()
-
-    if local_rank == 0:
-        model.save_pretrained("fine_tuned_squad_model")
-        tokenizer.save_pretrained("fine_tuned_squad_model")
-
     dist.destroy_process_group() 
 
 def main():
