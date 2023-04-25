@@ -1,0 +1,114 @@
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data import DistributedSampler
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from transformers import DefaultDataCollator
+from transformers import AutoModelForQuestionAnswering, TrainingArguments, Trainer
+
+from torch.utils.data import Dataset, DataLoader
+
+
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+import os, sys, traceback, socket, datetime
+from transformers import PegasusForConditionalGeneration, PegasusTokenizer
+
+import os
+import torch.multiprocessing as mp
+
+
+def process_data_to_model_inputs(batch):
+  tokenizer = PegasusTokenizer.from_pretrained('google/pegasus-small-xsum')
+  
+  encoder_max_length = 256
+  decoder_max_length = 64
+    
+    # tokenize the inputs and labels
+  inputs = tokenizer(batch["article"], padding="max_length", truncation=True, max_length=encoder_max_length)
+  outputs = tokenizer(batch["highlights"], padding="max_length", truncation=True, max_length=decoder_max_length)
+
+  batch["input_ids"] = inputs.input_ids
+  batch["attention_mask"] = inputs.attention_mask
+  batch["decoder_input_ids"] = outputs.input_ids
+  batch["decoder_attention_mask"] = outputs.attention_mask
+  batch["labels"] = outputs.input_ids.copy()
+
+  return batch
+
+def get_dataset():
+    train_dataset = load_dataset("cnn_dailymail", "3.0.0", split="train[:100]")
+    train_dataset = train_dataset.train_test_split(test_size=0.5)
+
+    return train_dataset
+
+def setup_distributed_environment():
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:25"
+    dist.init_process_group(backend='nccl')
+
+    torch.manual_seed(0)
+
+def train():
+    setup_distributed_environment()
+    
+    squad = get_dataset()
+
+    tokenized_squad = squad.map(
+        process_data_to_model_inputs, 
+        batched=True, 
+        remove_columns=["article", "highlights", "id"]
+    )
+
+    model = PegasusForConditionalGeneration.from_pretrained('google/pegasus-small-xsum')
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+
+    print(f'Inside Machine {global_rank}')
+
+    training_args = TrainingArguments(
+        output_dir="./updated_squad_fine_tuned_model",
+        evaluation_strategy="epoch",
+        learning_rate=2e-5,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        num_train_epochs=1,
+        weight_decay=0.01,
+        local_rank=local_rank,
+        fp16=True,
+        remove_unused_columns=False
+    )
+
+    data_collator = DefaultDataCollator()
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_squad["train"],
+        eval_dataset=tokenized_squad["test"],
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+    )
+
+    trainer.train()
+
+    if local_rank == 0:
+        model.save_pretrained("fine_tuned_squad_model")
+        tokenizer.save_pretrained("fine_tuned_squad_model")
+
+    dist.destroy_process_group() 
+
+def main():
+    torch.cuda.empty_cache()
+    
+    train()
+
+if __name__ == '__main__':
+    main()
