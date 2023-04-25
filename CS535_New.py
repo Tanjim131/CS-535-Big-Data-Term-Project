@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DistributedSampler
 from datasets import load_dataset
+
 from transformers import AutoTokenizer
 from transformers import DefaultDataCollator
 from transformers import AutoModelForQuestionAnswering, TrainingArguments, Trainer
-
+from transformers import T5Tokenizer
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -23,10 +24,11 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import os
 import torch.multiprocessing as mp
 
+#model_name = "t5-small"
+#tokenizer = T5Tokenizer.from_pretrained(model_name) 
+tokenizer = AutoTokenizer.from_pretrained("adasnew/t5-small-xsum")
 
 def process_data_to_model_inputs(batch):
-  #tokenizer = PegasusTokenizer.from_pretrained('google/pegasus-small')
-  
   
   encoder_max_length = 256
   decoder_max_length = 64
@@ -45,7 +47,7 @@ def process_data_to_model_inputs(batch):
 
 def get_dataset():
     train_dataset = load_dataset("xsum", split="train")
-    train_dataset = train_dataset.train_test_split(test_size=0.5)
+    #train_dataset = train_dataset.train_test_split(test_size=0.2)
 
     return train_dataset
 
@@ -55,7 +57,7 @@ def setup_distributed_environment():
 
     torch.manual_seed(0)
 
-tokenizer = AutoTokenizer.from_pretrained("adasnew/t5-small-xsum")
+
 def train():
     setup_distributed_environment()
     
@@ -64,11 +66,13 @@ def train():
     tokenized_squad = squad.map(
         process_data_to_model_inputs, 
         batched=True, 
+	batch_size=256,
         remove_columns=["document", "summary", "id"]
     )
 
     #model = PegasusForConditionalGeneration.from_pretrained('google/pegasus-small')
     model = AutoModelForSeq2SeqLM.from_pretrained("adasnew/t5-small-xsum")
+    #model = T5ForConditionalGeneration.from_pretrained('t5-small')
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -83,10 +87,10 @@ def train():
         output_dir="./updated_squad_fine_tuned_model",
         evaluation_strategy="epoch",
         learning_rate=2e-5,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        num_train_epochs=1,
-        weight_decay=0.01,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
+        num_train_epochs=2,
+        weight_decay=0.015,
         local_rank=local_rank,
         fp16=True,
         remove_unused_columns=False
@@ -104,6 +108,10 @@ def train():
     )
 
     trainer.train()
+    if local_rank == 0:
+        underlying_model = model.module
+        underlying_model.save_pretrained("fine_tuned_squad_model")
+        tokenizer.save_pretrained("fine_tuned_squad_model")
     dist.destroy_process_group() 
 
 def main():
